@@ -74,6 +74,7 @@ module Weigh
 
 import Control.Applicative
 import Control.Arrow
+import Control.Concurrent.Async ( async, wait )
 import Control.DeepSeq
 import Control.Monad.State
 import qualified Data.Foldable as Foldable
@@ -83,13 +84,14 @@ import qualified Data.List as List
 import Data.List.Split
 import Data.Maybe
 import GHC.Generics
+import GHC.Stats ( getRTSStatsEnabled )
 import Prelude
 import System.Environment
 import System.Exit
-import System.IO
-import System.IO.Temp
+-- import System.IO
+-- import System.IO.Temp
 import System.Mem
-import System.Process
+-- import System.Process
 import Text.Printf
 import qualified Weigh.GHCStats as GHCStats
 
@@ -170,6 +172,12 @@ mainWith m = do
 weighResults
   :: Weigh a -> IO ([Grouped (Weight,Maybe String)], Config)
 weighResults m = do
+
+  -- Check whether GC stats have been enabled.
+  rtsStatsEnabled <- getRTSStatsEnabled
+  unless rtsStatsEnabled
+    (error "GC stats not enabled. Use '+RTS -T -RTS' to enable them.")
+
   args <- getArgs
   weighEnv <- lookupEnv "WEIGH_CASE"
   let (config, cases) = execState (runWeigh m) (defaultConfig, [])
@@ -316,35 +324,43 @@ wgroup str wei = do
 
 -- | Weigh a set of actions. The value of the actions are forced
 -- completely to ensure they are fully allocated.
-weighDispatch :: Maybe String -- ^ The content of then env variable WEIGH_CASE.
+weighDispatch :: Maybe String     -- ^ The content of then env variable WEIGH_CASE.
               -> [Grouped Action] -- ^ Weigh name:action mapping.
-              -> IO (Maybe [(Grouped Weight)])
-weighDispatch args cases =
-  case args of
-    Just var -> do
-      let (label:fp:_) = read var
-      let !_ = force fp
-      case glookup label (force cases) of
-        Nothing -> error "No such case!"
-        Just act -> do
-          case act of
-            Action !run arg _ _ -> do
-              (bytes, gcs, liveBytes, maxByte) <-
-                case run of
-                  Right f -> weighFunc f arg
-                  Left m -> weighAction m arg
-              writeFile
-                fp
-                (show
-                   (Weight
-                    { weightLabel = label
-                    , weightAllocatedBytes = bytes
-                    , weightGCs = gcs
-                    , weightLiveBytes = liveBytes
-                    , weightMaxBytes = maxByte
-                    }))
-          return Nothing
-    _ -> fmap Just (Traversable.traverse (Traversable.traverse fork) cases)
+              -> IO (Maybe [Grouped Weight])
+weighDispatch _ cases =
+  fmap Just (Traversable.traverse (Traversable.traverse fork) cases)
+
+-- -- | Weigh a set of actions. The value of the actions are forced
+-- -- completely to ensure they are fully allocated.
+-- weighDispatch :: Maybe String -- ^ The content of then env variable WEIGH_CASE.
+--               -> [Grouped Action] -- ^ Weigh name:action mapping.
+--               -> IO (Maybe [(Grouped Weight)])
+-- weighDispatch args cases =
+--   case args of
+--     Just var -> do
+--       let (label:fp:_) = read var
+--       let !_ = force fp
+--       case glookup label (force cases) of
+--         Nothing -> error "No such case!"
+--         Just act -> do
+--           case act of
+--             Action !run arg _ _ -> do
+--               (bytes, gcs, liveBytes, maxByte) <-
+--                 case run of
+--                   Right f -> weighFunc f arg
+--                   Left m -> weighAction m arg
+--               writeFile
+--                 fp
+--                 (show
+--                    (Weight
+--                     { weightLabel = label
+--                     , weightAllocatedBytes = bytes
+--                     , weightGCs = gcs
+--                     , weightLiveBytes = liveBytes
+--                     , weightMaxBytes = maxByte
+--                     }))
+--           return Nothing
+--     _ -> fmap Just (Traversable.traverse (Traversable.traverse fork) cases)
 
 -- | Lookup an action.
 glookup :: String -> [Grouped Action] -> Maybe Action
@@ -355,34 +371,50 @@ glookup label =
 -- | Fork a case and run it.
 fork :: Action -- ^ Label for the case.
      -> IO Weight
-fork act =
-  withSystemTempFile
-    "weigh"
-    (\fp h -> do
-       hClose h
-       setEnv "WEIGH_CASE" $ show $ [actionName act,fp]
-       me <- getExecutablePath
-       args <- getArgs
-       (exit, _, err) <-
-         readProcessWithExitCode
-           me
-           (args ++ ["+RTS", "-T", "-RTS"])
-           ""
-       case exit of
-         ExitFailure {} ->
-           error
-             ("Error in case (" ++ show (actionName act) ++ "):\n  " ++ err)
-         ExitSuccess -> do
-           out <- readFile fp
-           case reads out of
-             [(!r, _)] -> return r
-             _ ->
-               error
-                 (concat
-                    [ "Malformed output from subprocess. Weigh"
-                    , " (currently) communicates with its sub-"
-                    , "processes via a temporary file."
-                    ]))
+fork (Action !run !arg !name _) = do
+  sync <- async $ do
+    (bytes, gcs, liveBytes, maxByte) <- case run of
+      Right f -> weighFunc   f arg
+      Left a  -> weighAction a arg
+    return Weight { weightLabel          = name
+                  , weightAllocatedBytes = bytes
+                  , weightGCs            = gcs
+                  , weightLiveBytes      = liveBytes
+                  , weightMaxBytes       = maxByte
+                  }
+  wait sync
+
+-- -- | Fork a case and run it.
+-- fork :: Action -- ^ Label for the case.
+--      -> IO Weight
+-- fork act =
+--   withSystemTempFile
+--     "weigh"
+--     (\fp h -> do
+--        hClose h
+--        setEnv "WEIGH_CASE" $ show $ [actionName act,fp]
+--        me <- getExecutablePath
+--        args <- getArgs
+--        (exit, _, err) <-
+--          readProcessWithExitCode
+--            me
+--            (args ++ ["+RTS", "-T", "-RTS"])
+--            ""
+--        case exit of
+--          ExitFailure {} ->
+--            error
+--              ("Error in case (" ++ show (actionName act) ++ "):\n  " ++ err)
+--          ExitSuccess -> do
+--            out <- readFile fp
+--            case reads out of
+--              [(!r, _)] -> return r
+--              _ ->
+--                error
+--                  (concat
+--                     [ "Malformed output from subprocess. Weigh"
+--                     , " (currently) communicates with its sub-"
+--                     , "processes via a temporary file."
+--                     ]))
 
 -- | Weigh a pure function. This function is built on top of `weighFuncResult`,
 --   which is heavily documented inside
